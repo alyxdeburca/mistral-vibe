@@ -161,6 +161,7 @@ from vibe.app_server.models import (
     PublicRetryCategory,
     PublicTurn,
     TurnErrorCode,
+    TokenUsage,
     TurnStop,
     UserInputCallbackDetail,
     UserInputCallbackOutput,
@@ -308,6 +309,29 @@ def _early_stop_reason(turn: PublicTurn | None) -> StopReason | None:
             return "max_tokens"
         case None:
             return None
+
+
+def _usage_since(
+    usage: TokenUsage, baseline: TokenUsage | None
+) -> Usage:
+    """Per-LLM-usage delta between ``usage`` and the prompt-start baseline.
+
+    ACP's ``PromptResponse.usage`` covers exactly this prompt, so the session's
+    cumulative counters must be reduced by what was already billed before it
+    began. Deltas never go negative: a reloaded session can re-report counters
+    that are below the baseline without it being a billing signal.
+    """
+    base = baseline if baseline is not None else TokenUsage()
+    input_tokens = max(0, usage.input_tokens - base.input_tokens)
+    output_tokens = max(0, usage.output_tokens - base.output_tokens)
+    return Usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        cached_read_tokens=usage.cached_input_tokens - base.cached_input_tokens
+        if usage.cached_input_tokens > base.cached_input_tokens
+        else None,
+    )
 
 
 def _project_acp_mcp_servers(
@@ -811,6 +835,9 @@ class VibeAcpAgent(AcpAgent):
         content = project_prompt(prompt)
         text = content.text
         message_id = str(uuid4())
+        # Taken before the command controller runs, so tokens a slash command
+        # spent (e.g. /compact) still bill to this prompt's usage.
+        baseline = self._raw_usage(session)
         try:
             command_result = await self._command_controller.execute(
                 session, text, message_id
@@ -855,12 +882,15 @@ class VibeAcpAgent(AcpAgent):
             self._send_usage_update(session)
             # Turn-level cancel: the client still waits for the prompt request
             # to settle, so the "cancelled" response must be delivered.
-            return PromptResponse(stop_reason="cancelled", usage=self._usage(session))
+            return PromptResponse(
+                stop_reason="cancelled", usage=self._turn_usage(session, baseline)
+            )
         except AppServerTurnError as exc:
             if exc.error.code == TurnErrorCode.RESPONSE_TOO_LONG:
                 self._send_usage_update(session)
                 return PromptResponse(
-                    stop_reason="max_tokens", usage=self._usage(session)
+                    stop_reason="max_tokens",
+                    usage=self._turn_usage(session, baseline),
                 )
             raise from_public_error(exc.error) from exc
         except Exception as exc:
@@ -876,7 +906,9 @@ class VibeAcpAgent(AcpAgent):
         self._send_usage_update(session)
         turn = next(reversed(session.app_server.state.turns or []), None)
         if (stop_reason := _early_stop_reason(turn)) is not None:
-            return PromptResponse(stop_reason=stop_reason, usage=self._usage(session))
+            return PromptResponse(
+                stop_reason=stop_reason, usage=self._turn_usage(session, baseline)
+            )
         show_feedback = await session.app_server.resources.feedback.should_show(
             pending_user_messages=1
         )
@@ -884,7 +916,7 @@ class VibeAcpAgent(AcpAgent):
             await session.app_server.resources.feedback.record("asked")
         return PromptResponse(
             stop_reason="end_turn",
-            usage=self._usage(session),
+            usage=self._turn_usage(session, baseline),
             field_meta={"show_feedback_prompt": True} if show_feedback else None,
         )
 
@@ -1782,14 +1814,27 @@ class VibeAcpAgent(AcpAgent):
         config = session.app_server.resources.config.current
         return [mode, build_model_config(config), make_thinking_response(config)]
 
+    def _raw_usage(self, session: AcpSession) -> TokenUsage:
+        return session.app_server.resources.runtime.stats.token_usage
+
     def _usage(self, session: AcpSession) -> Usage:
-        usage = session.app_server.resources.runtime.stats.token_usage
+        # Cumulative session counters: the shape UsageUpdate/`usage_update`
+        # report to the client.
+        usage = self._raw_usage(session)
         return Usage(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
             cached_read_tokens=usage.cached_input_tokens or None,
         )
+
+    def _turn_usage(
+        self, session: AcpSession, baseline: TokenUsage | None
+    ) -> Usage:
+        # PromptResponse.usage is per-turn, not cumulative: clients that build
+        # per-turn token/cost records from it (T3, Zed) read the delta this
+        # prompt covered, so the baseline is taken when the prompt arrives.
+        return _usage_since(self._raw_usage(session), baseline)
 
     def _send_usage_update(self, session: AcpSession) -> None:
         async def send() -> None:
