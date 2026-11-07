@@ -19,6 +19,7 @@ from vibe.app_server.models import (
     PublicEntryGenerationStatus,
     PublicTurn,
     PublicTurnStatus,
+    TokenUsage,
     UserInputCallbackDetail,
 )
 from vibe.app_server.protocol import (
@@ -40,6 +41,8 @@ def _make_agent(*, connection_closed: bool) -> tuple[VibeAcpAgent, AcpSession]:
     agent.client = cast(Any, client)
 
     app_server = MagicMock(spec=AppServerSession)
+    app_server.resources = MagicMock()
+    app_server.resources.runtime.stats.token_usage = TokenUsage()
     app_server.act = MagicMock(side_effect=asyncio.CancelledError)
     session = AcpSession(
         session_id="test-session",
